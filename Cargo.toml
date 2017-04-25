@@ -5,6 +5,7 @@ authors = ["Antoni Boucher <bouanto@zoho.com>"]
 
 [dependencies]
 futures = "^0.1.10"
+tokio-core = "^0.1.4"
 gdk-pixbuf = "^0.1.1"
 gdk-sys = "^0.3.3"
 gtk = "^0.1.2"

@@ -22,6 +22,7 @@
 #![feature(conservative_impl_trait, fn_traits, unboxed_closures)]
 
 extern crate futures;
+extern crate tokio_core;
 extern crate gdk_pixbuf;
 extern crate gdk_sys;
 extern crate gtk;
@@ -35,8 +36,11 @@ extern crate relm_derive;
 extern crate simplelog;
 
 use std::str::FromStr;
+use std::time::Duration;
 
-use futures::{Future, Stream};
+use futures::{Future, Stream, Sink};
+use futures::sync::mpsc::{channel, Sender};
+use tokio_core::reactor::Timeout;
 use gdk_pixbuf::PixbufLoader;
 use gdk_sys::GdkRGBA;
 use gtk::{
@@ -65,6 +69,7 @@ const RED: &GdkRGBA = &GdkRGBA { red: 1.0, green: 0.0, blue: 0.0, alpha: 1.0 };
 
 #[derive(Clone)]
 struct Model {
+    animation: Option<Sender<bool>>,
     gif_url: String,
     topic: String,
 }
@@ -74,6 +79,7 @@ enum Msg {
     DownloadCompleted,
     FetchUrl,
     HttpError(String),
+    Loading(usize),
     ImageChunk(Vec<u8>),
     NewGif(Vec<u8>),
     Quit,
@@ -95,6 +101,7 @@ impl Widget for Win {
 
     fn model() -> Model {
         Model {
+            animation: None,
             gif_url: "waiting.gif".to_string(),
             topic: "cats".to_string(),
         }
@@ -107,6 +114,7 @@ impl Widget for Win {
     fn update(&mut self, event: Msg, _model: &mut Model) {
         match event {
             DownloadCompleted => {
+                self.label.set_text("done");
                 self.button.set_sensitive(true);
                 self.button.grab_focus();
                 self.loader.close().unwrap();
@@ -114,7 +122,7 @@ impl Widget for Win {
                 self.loader = PixbufLoader::new();
             },
             FetchUrl => {
-                self.label.set_text("");
+                self.label.set_text("loading");
                 // Disable the button because loading 2 images at the same time crashes the pixbuf
                 // loader.
                 self.button.set_sensitive(false);
@@ -127,6 +135,9 @@ impl Widget for Win {
             ImageChunk(chunk) => {
                 self.loader.loader_write(&chunk).unwrap();
             },
+            Loading(n) => {
+                self.label.set_text(&"loading..."[..7+n]);
+            }
             NewGif(_) => (),
             Quit => gtk::main_quit(),
         }
@@ -138,6 +149,27 @@ impl Widget for Win {
                 let url = format!("https://api.giphy.com/v1/gifs/random?api_key=dc6zaTOxFJmzC&tag={}", model.topic);
                 let http_future = http_get(&url, relm.handle());
                 relm.connect_exec(http_future, NewGif, hyper_error_to_msg);
+
+                let (stop_tx, stop_rx) = channel(1);
+                model.animation = Some(stop_tx);
+                let handle = relm.handle().clone();
+                let animation = futures::stream::unfold(0_usize, move |step| {
+                    let next_step = if step < 3 { step + 1 } else { 0 };
+                    Some(Timeout::new(Duration::from_millis(500), &handle)
+                         .unwrap()
+                         .map(move |_| (step, next_step))
+                         .map_err(|_| ()))
+                })
+                    .map(|step| (step, false))
+                    .select(stop_rx.map(|_| (0, true)))
+                    .and_then(|(step, stop)| {
+                        if stop {
+                            Err(())
+                        } else {
+                            Ok(step)
+                        }
+                    });
+                relm.connect_exec_ignore_err(animation, Loading);
             },
             NewGif(result) => {
                 let string = String::from_utf8(result).unwrap();
@@ -146,6 +178,12 @@ impl Widget for Win {
                 let http_future = http_get_stream(url, relm.handle());
                 let future = relm.connect(http_future, ImageChunk, hyper_error_to_msg);
                 relm.connect_exec_ignore_err(future, DownloadCompleted);
+            },
+            DownloadCompleted => {
+                let mut state = None;
+                std::mem::swap(&mut model.animation, &mut state);
+                let stop_animation = state.unwrap().send(true).map(|_| ()).map_err(|_| ());
+                relm.exec(stop_animation);
             },
             _ => (),
         }
